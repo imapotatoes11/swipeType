@@ -23,18 +23,31 @@ pub extern "C" fn swipe_engine_load_dictionary(path: *const c_char) -> i32 {
         }
     };
 
-    let content = match std::fs::read_to_string(path_str) {
-        Ok(c) => c,
-        Err(_) => return -1,
-    };
+    match std::fs::read_to_string(path_str) {
+        Ok(content) => load(&content),
+        Err(_) => -1,
+    }
+}
 
+/// Builds the new index without holding the lock, so predictions against the
+/// previous dictionary keep working while a reload is in progress.
+fn load(content: &str) -> i32 {
+    let mut fresh = SwipeEngine::new();
     let mut engine = match ENGINE.lock() {
         Ok(e) => e,
         Err(_) => return -1,
     };
+    fresh.set_params(engine.params());
+    drop(engine);
 
-    engine.load_dictionary(&content);
-    engine.word_count() as i32
+    fresh.load_dictionary(content);
+    let count = fresh.word_count() as i32;
+    engine = match ENGINE.lock() {
+        Ok(e) => e,
+        Err(_) => return -1,
+    };
+    *engine = fresh;
+    count
 }
 
 /// Returns the number of words loaded, or -1 on error.
@@ -51,13 +64,7 @@ pub extern "C" fn swipe_engine_load_dictionary_str(content: *const c_char) -> i3
         }
     };
 
-    let mut engine = match ENGINE.lock() {
-        Ok(e) => e,
-        Err(_) => return -1,
-    };
-
-    engine.load_dictionary(content_str);
-    engine.word_count() as i32
+    load(content_str)
 }
 
 #[no_mangle]
@@ -89,28 +96,7 @@ pub extern "C" fn swipe_engine_predict(input: *const c_char, limit: i32) -> *mut
 
     let predictions = engine.predict(input_str, limit.max(0) as usize);
 
-    let mut json = String::from("[");
-    for (i, pred) in predictions.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push_str(r#"{"word":""#);
-        for ch in pred.word.chars() {
-            match ch {
-                '"' => json.push_str("\\\""),
-                '\\' => json.push_str("\\\\"),
-                '\n' => json.push_str("\\n"),
-                '\r' => json.push_str("\\r"),
-                '\t' => json.push_str("\\t"),
-                _ => json.push(ch),
-            }
-        }
-        json.push_str(&format!(
-            r#"","score":{:.4},"freq":{:.4}}}"#,
-            pred.score, pred.freq
-        ));
-    }
-    json.push(']');
+    let json = serde_json::to_string(&predictions).unwrap_or_else(|_| "[]".to_string());
 
     match CString::new(json) {
         Ok(s) => s.into_raw(),
