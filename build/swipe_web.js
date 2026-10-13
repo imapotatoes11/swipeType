@@ -29,6 +29,13 @@ export function predict_wasm(swipe_input, limit) {
     }
 }
 
+/**
+ * @param {number} weight
+ */
+export function set_pop_weight(weight) {
+    wasm.set_pop_weight(weight);
+}
+
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
