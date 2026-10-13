@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon.HIToolbox
+import Combine
 import os
 import SwiftUI
 
@@ -19,21 +20,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var statusItem: NSStatusItem?
-    private var statusTimer: Timer?
     private var globalClickMonitor: Any?
     private var localClickMonitor: Any?
+    private var cancellables = Set<AnyCancellable>()
+    private var isTapRetryScheduled = false
 
     private var settingsWindow: NSWindow?
+    private var onboardingWindow: NSWindow?
     private var initialActivationPolicy: NSApplication.ActivationPolicy?
+
+    private enum MenuTag {
+        static let status = 100
+        static let toggle = 101
+        static let permission = 102
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppSettings.registerDefaults()
 
         initialActivationPolicy = NSApp.activationPolicy()
-
-        Task { @MainActor in
-            AppState.shared.loadDictionary()
-        }
 
         updateStatusItemVisibility()
         NotificationCenter.default.addObserver(
@@ -43,17 +48,74 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(openSettingsFromNotification(_:)), name: .openSettings, object: nil
         )
-        setupGlobalHotkey()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(openOnboarding), name: .openOnboarding, object: nil
+        )
         overlayPanel = OverlayPanel()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(overlayDidHide), name: .hideOverlay, object: nil
         )
+
+        Task { @MainActor in
+            AppState.shared.loadDictionary()
+            self.observeState()
+            PermissionManager.shared.startMonitoring()
+
+            if !AppSettings.hasCompletedOnboarding || !PermissionManager.shared.isTrusted {
+                self.presentOnboardingWindow()
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         removeOutsideClickMonitors()
         removeEventTap()
+    }
+
+    /// The app has no Dock icon and the menu bar item can be hidden, so
+    /// launching it again from Finder or Spotlight is the way back in.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        Task { @MainActor in
+            if !AppSettings.hasCompletedOnboarding || !PermissionManager.shared.isTrusted {
+                self.presentOnboardingWindow()
+            } else {
+                self.presentSettingsWindow()
+            }
+        }
+        return true
+    }
+
+    @MainActor
+    private func observeState() {
+        PermissionManager.shared.$isTrusted
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] trusted in
+                self?.permissionDidChange(trusted)
+            }
+            .store(in: &cancellables)
+
+        AppState.shared.$isDictionaryLoaded
+            .combineLatest(AppState.shared.$isDictionaryLoading)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshStatusMenu()
+            }
+            .store(in: &cancellables)
+    }
+
+    @MainActor
+    private func permissionDidChange(_ trusted: Bool) {
+        if trusted {
+            installEventTap()
+        } else {
+            // A tap left running after the grant is revoked can wedge system
+            // input, so drop it straight away.
+            hideOverlayIfNeeded()
+            removeEventTap()
+        }
+        refreshStatusMenu()
     }
 
     private static func toggleOverlayMenuTitle() -> String {
@@ -73,27 +135,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let toggleItem = NSMenuItem(title: Self.toggleOverlayMenuTitle(), action: #selector(toggleOverlay), keyEquivalent: "")
         toggleItem.target = self
-        toggleItem.tag = 101
+        toggleItem.tag = MenuTag.toggle
         menu.addItem(toggleItem)
 
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: "")
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
 
+        let onboardingItem = NSMenuItem(title: "Setup Guide…", action: #selector(openOnboarding), keyEquivalent: "")
+        onboardingItem.target = self
+        menu.addItem(onboardingItem)
+
         menu.addItem(NSMenuItem.separator())
 
-        let statusItem = NSMenuItem(title: "Status: Loading...", action: nil, keyEquivalent: "")
-        statusItem.tag = 100
+        let statusItem = NSMenuItem(title: "Loading dictionary…", action: nil, keyEquivalent: "")
+        statusItem.tag = MenuTag.status
+        statusItem.isEnabled = false
         menu.addItem(statusItem)
 
+        let permissionItem = NSMenuItem(
+            title: "Grant \(PermissionManager.paneName) Access…",
+            action: #selector(openOnboarding),
+            keyEquivalent: ""
+        )
+        permissionItem.target = self
+        permissionItem.tag = MenuTag.permission
+        menu.addItem(permissionItem)
+
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit SwipeType", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         self.statusItem?.menu = menu
 
-        statusTimer?.invalidate()
-        statusTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateStatusMenuItem()
+        Task { @MainActor in
+            self.refreshStatusMenu()
         }
     }
 
@@ -114,18 +189,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func removeStatusItem() {
         guard let statusItem else { return }
-
-        statusTimer?.invalidate()
-        statusTimer = nil
-
         NSStatusBar.system.removeStatusItem(statusItem)
         self.statusItem = nil
     }
 
     private func updateToggleMenuItemTitle() {
         guard let menu = statusItem?.menu,
-              let item = menu.item(withTag: 101) else { return }
+              let item = menu.item(withTag: MenuTag.toggle) else { return }
         item.title = Self.toggleOverlayMenuTitle()
+    }
+
+    @MainActor
+    private func refreshStatusMenu() {
+        guard let menu = statusItem?.menu else { return }
+
+        if let item = menu.item(withTag: MenuTag.status) {
+            let state = AppState.shared
+            if state.isDictionaryLoaded {
+                item.title = "✓ \(state.dictionaryWordCount.formatted()) words loaded"
+            } else if state.isDictionaryLoading {
+                item.title = "Loading dictionary…"
+            } else {
+                item.title = "✗ Dictionary not loaded"
+            }
+        }
+
+        let trusted = PermissionManager.shared.isTrusted
+        menu.item(withTag: MenuTag.permission)?.isHidden = trusted
+        statusItem?.button?.appearsDisabled = !trusted
     }
 
     @objc private func openSettings() {
@@ -140,13 +231,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @MainActor
-    private func presentSettingsWindow() {
-        hideOverlayIfNeeded()
+    @objc private func openOnboarding() {
+        Task { @MainActor in
+            presentOnboardingWindow()
+        }
+    }
 
+    @MainActor
+    private func activateApp() {
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
         }
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    @MainActor
+    private func presentSettingsWindow() {
+        hideOverlayIfNeeded()
 
         let window: NSWindow
         if let settingsWindow {
@@ -155,7 +260,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window = makeSettingsWindow()
             settingsWindow = window
         }
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
     }
@@ -186,6 +291,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @MainActor
+    private func presentOnboardingWindow() {
+        hideOverlayIfNeeded()
+
+        let window: NSWindow
+        if let onboardingWindow {
+            window = onboardingWindow
+        } else {
+            window = makeOnboardingWindow()
+            onboardingWindow = window
+        }
+        activateApp()
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+
+    @MainActor
+    private func makeOnboardingWindow() -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: OnboardingView.windowSize),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Welcome to SwipeType"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.moveToActiveSpace]
+        window.delegate = self
+
+        let view = OnboardingView { [weak window] in
+            AppSettings.hasCompletedOnboarding = true
+            window?.close()
+        }
+        window.contentView = NSHostingView(rootView: view)
+        window.setContentSize(OnboardingView.windowSize)
+        window.center()
+
+        return window
+    }
+
+    @MainActor
     private func hideOverlayIfNeeded() {
         let isPanelVisible = overlayPanel?.isVisible ?? false
         guard isOverlayVisible() || isPanelVisible else { return }
@@ -197,28 +345,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow,
-              window == settingsWindow,
+        guard let window = notification.object as? NSWindow else { return }
+
+        if window == onboardingWindow {
+            // Rebuild next time so the guide starts from the first step.
+            onboardingWindow = nil
+        }
+
+        let otherWindowOpen = [settingsWindow, onboardingWindow]
+            .compactMap { $0 }
+            .contains { $0 != window && $0.isVisible }
+        guard !otherWindowOpen,
               let initialActivationPolicy,
               initialActivationPolicy != .regular else { return }
 
         NSApp.setActivationPolicy(initialActivationPolicy)
-    }
-
-    private func updateStatusMenuItem() {
-        guard let menu = statusItem?.menu,
-              let item = menu.item(withTag: 100) else { return }
-
-        Task { @MainActor in
-            let state = AppState.shared
-            if state.isDictionaryLoaded {
-                item.title = "✓ \(state.dictionaryWordCount) words loaded"
-                statusTimer?.invalidate()
-                statusTimer = nil
-            } else {
-                item.title = "✗ Dictionary not loaded"
-            }
-        }
     }
 
     @objc private func toggleOverlay() {
@@ -240,18 +381,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         removeOutsideClickMonitors()
     }
 
-    private func setupGlobalHotkey() {
-        guard PermissionManager.shared.checkAccessibilityPermission() else {
-            PermissionManager.shared.requestAccessibilityPermission()
-            PermissionManager.shared.startMonitoringPermission { [weak self] granted in
-                if granted {
-                    DispatchQueue.main.async {
-                        self?.setupGlobalHotkey()
-                    }
-                }
-            }
-            return
-        }
+    @MainActor
+    private func installEventTap() {
+        guard eventTap == nil, PermissionManager.shared.isTrusted else { return }
 
         let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
         guard let tap = CGEvent.tapCreate(
@@ -263,19 +395,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 AppDelegate.handleEvent(type: type, event: event, refcon: refcon)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else { return }
+        ) else {
+            // Trust can be reported a moment before the tap is allowed; retry.
+            scheduleTapRetry()
+            return
+        }
 
         eventTap = tap
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         if let source = runLoopSource {
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
         }
     }
 
+    @MainActor
+    private func scheduleTapRetry() {
+        guard !isTapRetryScheduled else { return }
+        isTapRetryScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self else { return }
+            self.isTapRetryScheduled = false
+            PermissionManager.shared.refresh()
+            self.installEventTap()
+        }
+    }
+
     private func removeEventTap() {
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let source = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes) }
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        if let tap = eventTap {
+            CFMachPortInvalidate(tap)
+        }
+        eventTap = nil
+        runLoopSource = nil
     }
 
     private func enableEventTap() {
@@ -340,7 +498,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue().enableEventTap()
                 }
             }
-            return nil
+            return Unmanaged.passUnretained(event)
         }
         guard type == .keyDown else { return Unmanaged.passUnretained(event) }
 
@@ -352,7 +510,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let flags = event.flags
 
         if AppSettings.matchesToggleOverlayHotkey(keyCode: keyCode, flags: flags) {
-            if type == .keyDown {
+            // Holding the hotkey would otherwise flicker the overlay.
+            if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
                 DispatchQueue.main.async {
                     guard let refcon else { return }
                     Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue().toggleOverlay()
@@ -437,6 +596,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
+    /// Maps physical key positions (ANSI key codes, independent of the active
+    /// input source) to the engine's QWERTY layout. Punctuation keys crossed
+    /// mid-swipe still shape the path.
     private static func keyCodeToChar(_ keyCode: Int) -> Character? {
         [kVK_ANSI_A: "a", kVK_ANSI_B: "b", kVK_ANSI_C: "c", kVK_ANSI_D: "d",
          kVK_ANSI_E: "e", kVK_ANSI_F: "f", kVK_ANSI_G: "g", kVK_ANSI_H: "h",
@@ -445,6 +607,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
          kVK_ANSI_Q: "q", kVK_ANSI_R: "r", kVK_ANSI_S: "s", kVK_ANSI_T: "t",
          kVK_ANSI_U: "u", kVK_ANSI_V: "v", kVK_ANSI_W: "w", kVK_ANSI_X: "x",
          kVK_ANSI_Y: "y", kVK_ANSI_Z: "z", kVK_ANSI_Comma: ",",
-         kVK_ANSI_Period: "."][keyCode]
+         kVK_ANSI_Period: ".", kVK_ANSI_Semicolon: ";", kVK_ANSI_Quote: "'",
+         kVK_ANSI_Slash: "/", kVK_ANSI_LeftBracket: "[", kVK_ANSI_RightBracket: "]"][keyCode]
     }
 }

@@ -17,6 +17,8 @@ enum AppSettings {
         static let overlayBackgroundOpacity = "overlayBackgroundOpacity"
         static let useTransparency = "useTransparency"
         static let playSwipeAnimation = "playSwipeAnimation"
+        static let insertUsingPaste = "insertUsingPaste"
+        static let hasCompletedOnboarding = "hasCompletedOnboarding"
     }
 
     enum ModifierBits {
@@ -28,7 +30,7 @@ enum AppSettings {
 
     enum Defaults {
         static let hotkeyPreset: ToggleHotkeyPreset = .shiftTab
-        static let showMenuBarItem = false
+        static let showMenuBarItem = true
 
         static let customToggleHotkeyKeyCode = kVK_ANSI_S
         static let customToggleHotkeyModifiers = ModifierBits.control | ModifierBits.option
@@ -40,6 +42,7 @@ enum AppSettings {
         static let overlayBackgroundOpacity: Double = 0.72
         static let useTransparency = true
         static let playSwipeAnimation = true
+        static let insertUsingPaste = false
     }
 
     struct Hotkey: Sendable {
@@ -117,6 +120,8 @@ enum AppSettings {
             Keys.overlayBackgroundOpacity: Defaults.overlayBackgroundOpacity,
             Keys.useTransparency: Defaults.useTransparency,
             Keys.playSwipeAnimation: Defaults.playSwipeAnimation,
+            Keys.insertUsingPaste: Defaults.insertUsingPaste,
+            Keys.hasCompletedOnboarding: false,
         ])
     }
 
@@ -135,6 +140,7 @@ enum AppSettings {
         defaults.removeObject(forKey: Keys.overlayBackgroundOpacity)
         defaults.removeObject(forKey: Keys.useTransparency)
         defaults.removeObject(forKey: Keys.playSwipeAnimation)
+        defaults.removeObject(forKey: Keys.insertUsingPaste)
         defaults.synchronize()
     }
 
@@ -169,6 +175,15 @@ enum AppSettings {
 
     static var playSwipeAnimation: Bool {
         (UserDefaults.standard.object(forKey: Keys.playSwipeAnimation) as? Bool) ?? Defaults.playSwipeAnimation
+    }
+
+    static var insertUsingPaste: Bool {
+        (UserDefaults.standard.object(forKey: Keys.insertUsingPaste) as? Bool) ?? Defaults.insertUsingPaste
+    }
+
+    static var hasCompletedOnboarding: Bool {
+        get { UserDefaults.standard.bool(forKey: Keys.hasCompletedOnboarding) }
+        set { UserDefaults.standard.set(newValue, forKey: Keys.hasCompletedOnboarding) }
     }
 
     static var useTransparency: Bool {

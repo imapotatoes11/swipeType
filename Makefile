@@ -5,8 +5,14 @@ VERSION_FILE := VERSION
 BUILD_NUMBER_FILE := BUILD_NUMBER
 MAC_APP_DIR := apps/mac
 RUST_SRC := crates/swipe-engine
-RUST_TARGET := aarch64-apple-darwin
+RUST_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
 RUST_LIB_NAME := libswipe_engine.a
+MACOS_DEPLOYMENT_TARGET := 13.0
+# Code signing identity. The default ad-hoc signature changes on every build,
+# which makes macOS forget the Accessibility grant. Pass a stable identity to
+# keep it, e.g. make mac-build SIGN_IDENTITY="Apple Development" DEVELOPMENT_TEAM=ABCDE12345
+SIGN_IDENTITY ?= -
+DEVELOPMENT_TEAM ?=
 
 # --- Web ---
 web-build:
@@ -35,24 +41,35 @@ version-bump:
 
 # --- Rust ---
 rust-build:
-	cd $(RUST_SRC) && cargo build --release --features ffi --target $(RUST_TARGET)
+	@if command -v rustup >/dev/null 2>&1; then rustup target add $(RUST_TARGETS); fi
+	cd $(RUST_SRC) && for target in $(RUST_TARGETS); do \
+		MACOSX_DEPLOYMENT_TARGET=$(MACOS_DEPLOYMENT_TARGET) cargo build --release --features ffi --target $$target || exit 1; \
+	done
 	mkdir -p $(MAC_APP_DIR)/Rust
-	cp target/$(RUST_TARGET)/release/$(RUST_LIB_NAME) $(MAC_APP_DIR)/Rust/$(RUST_LIB_NAME)
+	lipo -create $(foreach target,$(RUST_TARGETS),target/$(target)/release/$(RUST_LIB_NAME)) \
+		-output $(MAC_APP_DIR)/Rust/$(RUST_LIB_NAME)
 
 # --- Mac ---
 mac-xcode: version-sync
 	cd $(MAC_APP_DIR) && xcodegen generate
 
 mac-build: version-bump mac-xcode rust-build
-	cd $(MAC_APP_DIR) && xcodebuild -project SwipeTypeMac.xcodeproj -scheme SwipeTypeMac -configuration Release -derivedDataPath BuildData build
+	cd $(MAC_APP_DIR) && xcodebuild -project SwipeTypeMac.xcodeproj -scheme SwipeTypeMac -configuration Release -derivedDataPath BuildData \
+		CODE_SIGN_IDENTITY="$(SIGN_IDENTITY)" $(if $(DEVELOPMENT_TEAM),DEVELOPMENT_TEAM=$(DEVELOPMENT_TEAM)) build
+	rm -rf $(MAC_APP_DIR)/build/Release/SwipeType.app
 	mkdir -p $(MAC_APP_DIR)/build/Release
 	cp -R $(MAC_APP_DIR)/BuildData/Build/Products/Release/SwipeType.app $(MAC_APP_DIR)/build/Release/
 
+# Launch through LaunchServices: running the binary from a shell makes the
+# terminal the "responsible" app, so macOS checks the terminal's permissions
+# instead of SwipeType's and the hotkey never works.
 mac-run:
-	./$(MAC_APP_DIR)/build/Release/SwipeType.app/Contents/MacOS/SwipeType
+	-pkill -x SwipeType
+	open -n $(MAC_APP_DIR)/build/Release/SwipeType.app
 
 mac-install: mac-build
-	cp -r $(MAC_APP_DIR)/build/Release/SwipeType.app /Applications/
+	rm -rf /Applications/SwipeType.app
+	cp -R $(MAC_APP_DIR)/build/Release/SwipeType.app /Applications/
 
 mac-dmg: mac-build
 	@echo "Packaging into DMG..."

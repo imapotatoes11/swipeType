@@ -87,7 +87,11 @@ struct ContentView: View {
             )
 
             HStack {
-                Text("computed in \(String(format: "%.3f", appState.predictionTime))s")
+                if appState.isDictionaryLoaded {
+                    Text("computed in \(String(format: "%.3f", appState.predictionTime))s")
+                } else {
+                    Text(appState.isDictionaryLoading ? "loading dictionary…" : "dictionary not loaded")
+                }
                 Spacer()
                 if appState.actualWPM > 0 {
                     Text("\(appState.actualWPM) actual WPM")
@@ -359,11 +363,12 @@ struct KeyboardView: View {
         ("Q", 0, 0), ("W", 1, 0), ("E", 2, 0), ("R", 3, 0), ("T", 4, 0),
         ("Y", 5, 0), ("U", 6, 0), ("I", 7, 0), ("O", 8, 0), ("P", 9, 0),
         ("[", 10, 0), ("]", 11, 0), ("\\", 12, 0),
-        ("A", 1, 1), ("S", 2, 1), ("D", 3, 1), ("F", 4, 1), ("G", 5, 1),
-        ("H", 6, 1), ("J", 7, 1), ("K", 8, 1), ("L", 9, 1),
-        (";", 10, 1), ("'", 11, 1),
-        ("Z", 1.5, 2), ("X", 2.5, 2), ("C", 3.5, 2), ("V", 4.5, 2), ("B", 5.5, 2),
-        ("N", 6.5, 2), ("M", 7.5, 2), (",", 8.5, 2), (".", 9.5, 2), ("/", 10.5, 2)
+        // Rows are staggered like a physical Mac keyboard (and the engine).
+        ("A", 0.25, 1), ("S", 1.25, 1), ("D", 2.25, 1), ("F", 3.25, 1), ("G", 4.25, 1),
+        ("H", 5.25, 1), ("J", 6.25, 1), ("K", 7.25, 1), ("L", 8.25, 1),
+        (";", 9.25, 1), ("'", 10.25, 1),
+        ("Z", 0.75, 2), ("X", 1.75, 2), ("C", 2.75, 2), ("V", 3.75, 2), ("B", 4.75, 2),
+        ("N", 5.75, 2), ("M", 6.75, 2), (",", 7.75, 2), (".", 8.75, 2), ("/", 9.75, 2)
     ]
 
     private let idleLoopPadding: TimeInterval = 0.4

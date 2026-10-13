@@ -18,6 +18,7 @@ final class AppState: ObservableObject {
     @Published var predictionTime: TimeInterval = 0
     @Published var actualWPM: Int = 0
     @Published var isDictionaryLoaded = false
+    @Published var isDictionaryLoading = false
     @Published var dictionaryWordCount = 0
 
     private var requestId = 0
@@ -26,10 +27,23 @@ final class AppState: ObservableObject {
 
     private init() {}
 
+    /// Builds the engine index off the main thread; the event tap runs on the
+    /// main run loop and macOS disables taps that stall for too long.
     func loadDictionary() {
-        let wordCount = SwipeEngineBridge.shared.loadBundledDictionary()
-        isDictionaryLoaded = wordCount > 0
-        dictionaryWordCount = wordCount
+        guard !isDictionaryLoading else { return }
+        isDictionaryLoading = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let wordCount = SwipeEngineBridge.shared.loadBundledDictionary()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.isDictionaryLoading = false
+                self.isDictionaryLoaded = wordCount > 0
+                self.dictionaryWordCount = max(wordCount, 0)
+                if !self.currentInput.isEmpty {
+                    self.triggerPrediction()
+                }
+            }
+        }
     }
 
     func addCharacter(_ char: Character) -> String? {

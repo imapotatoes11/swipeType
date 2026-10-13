@@ -21,7 +21,7 @@ int32_t swipe_engine_load_dictionary_str(const char *content);
 /// Get the number of words in the dictionary
 int32_t swipe_engine_word_count(void);
 
-/// Predict words from swipe input (format: "x1,y1;x2,y2;...")
+/// Predict words from swipe input: the keys the swipe passed over, in order (e.g. "hgfdertyuiklo")
 /// Returns a JSON string with predictions array
 /// Caller must free with swipe_engine_free_string
 char *swipe_engine_predict(const char *input, int32_t limit);

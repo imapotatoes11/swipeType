@@ -119,4 +119,5 @@ class OverlayPanel: NSPanel {
 extension Notification.Name {
     static let hideOverlay = Notification.Name("hideOverlay")
     static let openSettings = Notification.Name("openSettings")
+    static let openOnboarding = Notification.Name("openOnboarding")
 }

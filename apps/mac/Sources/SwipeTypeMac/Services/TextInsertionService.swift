@@ -20,6 +20,49 @@ class TextInsertionService {
             return
         }
 
+        if AppSettings.insertUsingPaste {
+            paste(contentToPaste, trailingKeys: trailingKeys)
+        } else {
+            DispatchQueue.main.async {
+                self.typeText(contentToPaste)
+                self.sendTrailingKeys(trailingKeys)
+            }
+        }
+    }
+
+    /// Types the text as Unicode keyboard events. Leaves the clipboard (and
+    /// clipboard history apps) alone and has no timing race with the target app.
+    private func typeText(_ text: String) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let units = Array(text.utf16)
+        // CGEventKeyboardSetUnicodeString accepts at most 20 UTF-16 units per event.
+        let maxChunk = 20
+        var start = 0
+        while start < units.count {
+            var end = min(start + maxChunk, units.count)
+            // Do not split a surrogate pair across events.
+            if end < units.count, UTF16.isLeadSurrogate(units[end - 1]) {
+                end -= 1
+            }
+            let chunk = Array(units[start..<end])
+            start = end
+
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { continue }
+            chunk.withUnsafeBufferPointer { buffer in
+                down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
+                up.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
+            }
+            down.flags = []
+            up.flags = []
+            markSynthetic(down)
+            markSynthetic(up)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func paste(_ contentToPaste: String, trailingKeys: [TrailingKey]) {
         let pasteboard = NSPasteboard.general
         let hadInitialContents = pasteboard.pasteboardItems?.isEmpty == false
 
@@ -44,7 +87,7 @@ class TextInsertionService {
                 }
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 guard pasteboard.changeCount == expectedChangeCount else { return }
                 if !savedContents.isEmpty {
                     pasteboard.clearContents()

@@ -19,9 +19,10 @@ struct SettingsView: View {
     @AppStorage(AppSettings.Keys.overlayBackgroundOpacity) private var overlayBackgroundOpacity = AppSettings.Defaults.overlayBackgroundOpacity
     @AppStorage(AppSettings.Keys.useTransparency) private var useTransparency = AppSettings.Defaults.useTransparency
     @AppStorage(AppSettings.Keys.playSwipeAnimation) private var playSwipeAnimation = AppSettings.Defaults.playSwipeAnimation
+    @AppStorage(AppSettings.Keys.insertUsingPaste) private var insertUsingPaste = AppSettings.Defaults.insertUsingPaste
 
+    @ObservedObject private var permissions = PermissionManager.shared
     @State private var isShowingResetConfirmation = false
-    @State private var hasAccessibilityPermission = PermissionManager.shared.checkAccessibilityPermission()
 
     private var appVersionText: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -146,6 +147,7 @@ struct SettingsView: View {
                             ToggleGroup(title: "Require pause before select", isOn: $requirePauseBeforeCommit, description: "Prevents accidental selection while swiping.")
                             ToggleGroup(title: "Add space after word", isOn: $insertTrailingSpace, description: "Appends a space after selection.")
                             ToggleGroup(title: "Play swipe animation", isOn: $playSwipeAnimation, description: "Replays path on overlay keyboard.")
+                            ToggleGroup(title: "Insert by pasting", isOn: $insertUsingPaste, description: "Uses the clipboard, for apps that ignore typed input.")
 
                             VStack(alignment: .leading, spacing: 4) {
                                 LabeledContent("Pause duration") {
@@ -164,37 +166,9 @@ struct SettingsView: View {
                         }
                     }
                     
-                    VStack(alignment: .leading, spacing: 8) {
-                                                HStack {
-                                                    Text("Accessibility")
-                                                        .font(.subheadline.bold())
-                                                        .foregroundColor(.white) // Always white
-                        
-                                                     Image(systemName: hasAccessibilityPermission ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                                         .foregroundColor(hasAccessibilityPermission ? .green : .red)
-                        
-                                                    Spacer()
-                        
-                                                     if !hasAccessibilityPermission {
-                                                         Button("Open Settings") {
-                                                            PermissionManager.shared.openAccessibilitySettings() // Direct call
-                                                        }
-                                                        .buttonStyle(.bordered)
-                                                        .controlSize(.small)
-                                                    }
-                                                }
-                                                .padding(12)
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .background(Color.primary.opacity(0.03))
-                                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
+                    PermissionStatusCard(permissions: permissions)
                 }
                 .frame(width: 360)
-                .onAppear {
-                    PermissionManager.shared.startMonitoringPermission { granted in
-                        hasAccessibilityPermission = granted
-                    }
-                }
 
 
                 VStack(alignment: .leading, spacing: 20) {
@@ -273,12 +247,23 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             
-                            Link(destination: URL(string: "https://github.com/ZimengXiong/swipeType")!) {
-                                Label("GitHub", systemImage: "link")
-                                    .font(.caption.bold())
+                            HStack(spacing: 8) {
+                                Link(destination: URL(string: "https://github.com/ZimengXiong/swipeType")!) {
+                                    Label("GitHub", systemImage: "link")
+                                        .font(.caption.bold())
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                                Button {
+                                    NotificationCenter.default.post(name: .openOnboarding, object: nil)
+                                } label: {
+                                    Label("Setup Guide", systemImage: "sparkles")
+                                        .font(.caption.bold())
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
                         }
                     }
                 }
@@ -359,7 +344,7 @@ struct SettingsView: View {
     }
 }
 
-private struct MockKeyboardView: View {
+struct MockKeyboardView: View {
     let input: String
     
     private let keyboardLayout: [(String, CGFloat, CGFloat)] = [
@@ -469,7 +454,7 @@ private struct MockKeyboardView: View {
     }
 }
 
-private struct MockRow: View {
+struct MockRow: View {
     let text: String
     let primary: Bool
     
@@ -487,6 +472,66 @@ private struct MockRow: View {
         .padding(.vertical, 3)
         .background(Color.white.opacity(primary ? 0.15 : 0.08))
         .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+/// Live permission status with the actions needed to fix it. Shared by
+/// Settings and the setup guide.
+struct PermissionStatusCard: View {
+    @ObservedObject var permissions: PermissionManager
+    @State private var isResetting = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(PermissionManager.paneName)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.primary)
+
+                Image(systemName: permissions.isTrusted ? "checkmark.circle.fill" : "xmark.circle.fill")
+                    .foregroundColor(permissions.isTrusted ? .green : .red)
+
+                Spacer()
+
+                if !permissions.isTrusted {
+                    Button("Open Settings") {
+                        permissions.requestAccess()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            if !permissions.isTrusted {
+                Text("Turn on SwipeType in \(PermissionManager.settingsPath). Already on? Updates and rebuilds can leave a stale entry behind.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary.opacity(0.8))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Button {
+                    isResetting = true
+                    permissions.resetAndRequestAccess()
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        isResetting = false
+                    }
+                } label: {
+                    Label(isResetting ? "Re-registering…" : "Reset & Re-register", systemImage: "arrow.counterclockwise")
+                        .font(.caption)
+                }
+                .buttonStyle(.link)
+                .disabled(isResetting)
+            } else if permissions.isSecureInputActive {
+                Label("Secure input is on in another app (a password field or Terminal), so keys can't be read right now.", systemImage: "lock.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
